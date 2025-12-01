@@ -579,8 +579,23 @@ saveRDS(series.filtered,
 
 #######
 
-library(GEOquery)
 library(httr)
+library(jsonlite)
+library(dplyr)
+library(data.table)
+library(edgeR)
+library(limma)
+library(tidyr)
+library(stringr)
+library(R.utils)
+library(GEOquery)
+
+source("~/Documents/Publications/webGEO/script/helper_functions.R")
+
+setwd("~/Documents/BioinfoCamp/projects/cloud_platform/OmicsMine/backend/")
+
+getOption("timeout")
+options(timeout = max(1000, getOption("timeout")))
 
 # series_table <- read.csv("~/Documents/BioinfoCamp/projects/cloud_platform/OmicsMine/backend/data/gse_series_summary_table.csv",
 #                          header = T, stringsAsFactors = F)
@@ -609,7 +624,6 @@ series.filtered$N_Samples <- stats$N[idx]
 series.filtered <- series.filtered %>% arrange(N_Samples)
 series.filtered
 
-
 pd_pkgs <- unique(series.filtered$Package)
 pd_pkgs
 
@@ -630,18 +644,40 @@ completed <- gsub("_Normalized_Data.rds", "", list.files(file.path(base.dir, "no
 remaining <- which(!paste0(series.filtered$Series, "-", series.filtered$Platform) %in% completed)
 remaining
 
-which(series.filtered$Series[remaining] == "GSE117468")
-which(remaining==24527)
+which(series.filtered$Series[remaining] == "GSE16778")
+which(remaining==23923)
 
-series.filtered$Series[remaining[1665]]
+series.filtered$Series[remaining[1618]]
 
-# 23923 huge
+# GSE18927 huge(a lot of bam/bed files), ncbi rnaseq count available, download CEL files programmatically
 
-for (i in remaining[-c(1:1888)]) {
+### RStudio session is stopped while processing the data
+gse_rstudio_stopped <- c(
+  "GSE131952","GSE54003","GSE115971","GSE23821","GSE159917",
+  "GSE140424","GSE50133","GSE218706","GSE84709","GSE115947",
+  "GSE89050","GSE272973","GSE46465","GSE23640","GSE25645",
+  "GSE144139","GSE58102","GSE17373","GSE58911","GSE236145",
+  "GSE25643","GSE150707","GSE155716","GSE91006","GSE10631",
+  "GSE165813","GSE46222","GSE34289","GSE57528","GSE85268",
+  "GSE14352","GSE5460","GSE36059"
+)
+
+dt.list <- list()
+
+length(remaining)
+
+for (i in remaining) {
   
   gse <- series.filtered$Series[i]
   anno <- series.filtered$Package[i]
   gpl <- series.filtered$Platform[i]
+  
+  dataset <- paste0(gse, "-", gpl)
+  
+  if (gse %in% gse_rstudio_stopped) {
+    dt.list[[dataset]] <- "RStudio is stopped"
+    next
+  }
   
   taxonomy <- series.filtered$Taxonomy[i]
   
@@ -659,7 +695,8 @@ for (i in remaining[-c(1:1888)]) {
   response <- HEAD(url)
   
   if (status_code(response) != 200) {
-    message("supp is not available!")
+    message("Supp is not available!")
+    dt.list[[dataset]] <- "Supp is not available"
     next
   }
   
@@ -668,6 +705,7 @@ for (i in remaining[-c(1:1888)]) {
   
   if (status_code(response) != 200) {
     message("RAW is not available!")
+    dt.list[[dataset]] <- "RAW is not available"
     next
   }
   
@@ -676,15 +714,16 @@ for (i in remaining[-c(1:1888)]) {
   
   if (size_mb > 2000) {
     message("Large file, skip!")
+    dt.list[[dataset]] <- "Large RAW file"
     next
   }
   
   gse.samples <- samples.filtered %>% filter(Series==gse, Platform==gpl) %>% pull(Accession)
   # print(sprintf("GSE samples - %s", length(gse.samples)))
-  
-  filePaths = getGEOSuppFiles(gse, baseDir = file.path(base.dir, "raw"), makeDirectory = FALSE, filter_regex = 'RAW')
-  untar(file.path(base.dir, "raw", paste0(gse, '_RAW.tar')), exdir = file.path(base.dir, "raw", paste0(gse, '_RAW')))
-  
+  if (! dir.exists(file.path(base.dir, "raw", paste0(gse, '_RAW')))) {
+    filePaths = getGEOSuppFiles(gse, baseDir = file.path(base.dir, "raw"), makeDirectory = FALSE, filter_regex = 'RAW')
+    untar(file.path(base.dir, "raw", paste0(gse, '_RAW.tar')), exdir = file.path(base.dir, "raw", paste0(gse, '_RAW')))
+  }
   celFiles = list.celfiles(file.path(base.dir, "raw", paste0(gse, '_RAW')), full.names=T, listGzipped=T)
   
   # print(sprintf("CEL samples - %s", length(celFiles)))
@@ -700,12 +739,36 @@ for (i in remaining[-c(1:1888)]) {
   
   if (length(celFiles) != length(gse.samples) | length(celFiles) == 0) {
     print("Sample size is not consistent !")
+    dt.list[[dataset]] <- sprintf("Sample size is not consistent: %s - %s", 
+                                  length(gse.samples), length(celFiles))
     next
   }
   
-  rawData = read.celfiles(celFiles, pkgname = anno, verbose = F)
+  rawData <- tryCatch({
+    read.celfiles(celFiles, pkgname = anno, verbose = F)
+  }, error = function(e) {
+    cat("Error message:", e$message, "\n")
+    return(NULL)
+  })
   
-  probesetData = oligo::rma(rawData)
+  if (is.null(rawData)) {
+    message("CEL file is corrupted")
+    dt.list[[dataset]] <- "CEL file is corrupted"
+    next
+  }
+  
+  probesetData <- tryCatch({
+    oligo::rma(rawData)
+  }, error = function(e) {
+    cat("Error message:", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(probesetData)) {
+    message("Subscript out of bounds")
+    dt.list[[dataset]] <- "Subscript out of bounds"
+    next
+  }
   
   exprData = exprs(probesetData)
   
@@ -737,9 +800,104 @@ for (i in remaining[-c(1:1888)]) {
   
 }
 
-
 # expr <- readRDS("data/microarray/affymetrix/normalized/GSE180556-GPL6246_Normalized_Data.rds")
-View(expr)
+# View(expr)
+
+
+write.csv(dt, file="data/missing_datasets_affymetrix.csv", quote = F)
+
+sort(table(dt$Reason))
+
+
+
+
+
+### GSE18927
+# Huge RAW file (a lot of bam/bed files)
+# Ncbi rnaseq count available
+# Download individual CEL files
+
+gse <- "GSE18927"
+gpl <- series.filtered %>% filter(Series == gse) %>% pull(Platform)
+anno <- series.filtered %>% filter(Series == gse) %>% pull(Package)
+taxonomy <- series.filtered %>% filter(Series == gse) %>% pull(Taxonomy)
+
+gse.samples <- samples.filtered %>% filter(Series==gse, Platform==gpl) %>% pull(Accession)
+gse.samples
+
+dir.create(file.path(base.dir, "raw", paste0(gse, "_RAW")))
+
+file_list_url <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE18nnn/GSE18927/suppl/filelist.txt"
+
+file_list <- read.delim(file_list_url)
+file_names <- file_list %>% filter(Type=="CEL") %>% pull(Name)
+
+for (file in file_names) {
+  gsm <- strsplit(file, "_")[[1]][1]
+  print(gsm)
+  filePaths = getGEOSuppFiles(gsm, baseDir = file.path(base.dir, "raw", paste0(gse, "_RAW")), makeDirectory = FALSE, filter_regex = 'CEL.gz')
+}
+
+exprData <- processAffyData(gse, gpl, anno, taxonomy, gse.samples, base_dir)
+
+if (! is.na(exprData)) {
+  saveRDS(exprData, file=file.path(base.dir, "normalized", sprintf("%s-%s_Normalized_Data.rds", gse, gpl)))
+}
+
+processAffyData <- function(gse, gpl, anno, taxonomy, gse.samples, base_dir) {
+  
+  celFiles = list.celfiles(file.path(base.dir, "raw", paste0(gse, '_RAW')), full.names=T, listGzipped=T)
+  
+  .samples <- unlist(lapply(basename(celFiles), function(x) strsplit(x, '_|\\.')[[1]][1]))
+  
+  idx <- which(.samples %in% gse.samples)
+  celFiles <- celFiles[idx]
+  
+  print(sprintf("Number of samples: %s", length(celFiles)))
+  
+  if (length(celFiles) != length(gse.samples) | length(celFiles) == 0) {
+    print("Sample size is not consistent !")
+  }
+  
+  rawData <- tryCatch({
+    read.celfiles(celFiles, pkgname = anno, verbose = F)
+  }, error = function(e) {
+    cat("Error message:", e$message, "\n")
+    return(NULL)
+  })
+  
+  probesetData <- tryCatch({
+    oligo::rma(rawData)
+  }, error = function(e) {
+    cat("Error message:", e$message, "\n")
+    return(NULL)
+  })
+  
+  exprData = exprs(probesetData)
+  
+  rownames(exprData) <- unlist(lapply(rownames(exprData), function(x) strsplit(x, '_|\\.')[[1]][1]))
+  colnames(exprData) <- unlist(lapply(colnames(exprData), function(x) strsplit(x, '_|\\.')[[1]][1]))
+  
+  if (taxonomy == "Mus musculus") {
+    ensembl = "ENSMUSG"
+  } else if (taxonomy == "Homo sapiens") {
+    ensembl = "ENSG"
+  } 
+  
+  filter <- which(!startsWith(rownames(exprData), ensembl))
+  
+  if (length(filter) > 0) {
+    exprData <- exprData[-filter,]
+  }
+  
+  if (sum(is.na(expr))>0) {
+    print("NAs in the dataset")
+    exprData <- NULL
+  }
+  
+  return(exprData)
+  
+}
 
 
 ### Illumina
